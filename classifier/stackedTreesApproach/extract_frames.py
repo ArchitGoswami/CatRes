@@ -12,6 +12,11 @@ Usage:
     python extract_frames.py --video_dir raw_videos/ --out_dir frames/ --n_frames 8
 """
 
+# TODO: Use FFMPEG for faster frame extraction, especially for large videos. OpenCV is
+#       convenient but slow. Also ran into glitches.
+
+# NOTE: 'chmod -R 770 *' used to make all files and subfolders readable/writable/executable by owner and group, but not others.
+
 import argparse
 import os
 from pathlib import Path
