@@ -2,6 +2,64 @@
 
 Here's a categorized list of **publicly available datasets** you can pull from, organized by which class they'd serve as negatives for.
 
+## What this data feeds
+
+All three approaches in this repo (`high_compute_nn_cascade/`,
+`low_compute_nn_flat/`, `stacked_trees_cascade/`) consume the **same**
+two inputs, built from the datasets below:
+
+1. `raw_videos/` — a folder of `.mp4`/`.mov`/`.avi`/`.mkv` files (the
+   only formats `extract_frames.py` currently reads).
+2. `labels.csv` — one row per video, columns `video_id, is_surgery, surgery_type`:
+   - `video_id` must exactly match the video's filename stem (e.g. a
+     file `cataract_0042.mp4` needs `video_id = cataract_0042`) — this
+     is how frames, embeddings, and labels get joined back together.
+   - `is_surgery`: `1` for anything in the "Class 2" and "Class 3"
+     tables below, `0` for anything in "Class 1".
+   - `surgery_type`: `cataract` for Class 3 rows, `other_surgery` for
+     Class 2 rows, blank for Class 1 rows (`is_surgery=0`).
+
+So this dataset list isn't just background reading — every dataset you
+pull from here needs to become a set of video files in `raw_videos/`
+plus matching rows in `labels.csv` using exactly those three columns.
+
+## Making this data actually train the model well
+
+A few things worth doing deliberately, not just "grab everything above":
+
+- **Cap the easy-negative flood.** Kinetics/Something-Something/ActivityNet
+  are 20K–700K clips; your cataract-positive data (Class 3) tops out
+  around 100–150 videos total across CATARACTS + Cataract-101. If you
+  dump all of Kinetics in, Stage 1 (`is_surgery`) will learn "surgery
+  footage looks nothing like the 99% of the data" and won't have seen
+  enough hard negatives. Subsample the easy-negative datasets down to
+  roughly the same order of magnitude as your surgery-side data (or at
+  least cap it — a few hundred to low thousands of clips is plenty),
+  and lean on the "Tip" callout below for the classes that actually
+  look surgery-adjacent.
+- **Stage 2 balance matters more than Stage 1.** `is_cataract` is
+  trained only on surgery videos, and cataract vs. other-surgery access
+  is the whole point of the "hard negative" framing here. Track the
+  cataract : other-surgery ratio directly — `train_*_cascade.py`
+  already prints this count before training Stage 2, so use it as a
+  checkpoint before committing to a full run.
+- **No video should appear in more than one split.** The training
+  scripts split at the video level (one embedding row per video), so as
+  long as `video_id` is unique per source video this is already safe —
+  just don't split a single long surgical video into multiple clips
+  with different `video_id`s that could land on both sides of a
+  train/val split.
+- **Match frame-extraction settings across sources.** Per the practical
+  note below, keep `--n_frames` and resolution consistent across every
+  dataset you pull in — CLIP shouldn't be able to tell "this is
+  Kinetics vs. this is CATARACTS" from compression artifacts or frame
+  rate alone.
+- **Images-only datasets (DeepDR/EyePACS, CHAOS) aren't usable as-is.**
+  `extract_frames.py` only reads video files. Either find a video
+  subset of these, skip them, or convert stills into single-frame
+  "videos" only if you're deliberately testing the image-domain-shift
+  case — don't silently mix formats.
+
 ---
 
 ## Class 1 Negatives: "Not Surgery"

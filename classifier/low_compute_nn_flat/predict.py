@@ -1,11 +1,11 @@
 """
-predict_option_a.py
+predict.py (low_compute_nn_flat)
 
-Loads the trained MLP + scaler and classifies new videos from
-their pre-computed CLIP embeddings.
+Loads the trained flat MLP + scaler (produced by train_flat_mlp.py) and
+classifies new videos from their pre-computed CLIP embeddings.
 
 Usage:
-    python predict_option_a.py --embeddings new_embeddings.parquet \
+    python predict.py --embeddings new_embeddings.parquet \
         --model_dir models_mlp/ --out_csv predictions.csv
 """
 import argparse
@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import torch
 from joblib import load
-from train_mlp_option_a import MLPClassifier  # reuse the class definition
+from train_flat_mlp import MLPClassifier  # reuse the class definition
 
 
 def main():

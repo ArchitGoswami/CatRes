@@ -1,21 +1,26 @@
 """
-train_cascade.py
+train_trees_cascade.py
 
-Trains the two-stage cascade:
+stacked_trees_cascade: trains the two-stage cascade using GRADIENT-BOOSTED
+DECISION TREES for each stage (this is the folder's namesake — previously
+this script trained plain logistic regression, which isn't a tree model at
+all; see the NOTE at the bottom of this file for that history):
+
     Stage 1: is_surgery       (all videos, binary)
     Stage 2: is_cataract      (surgery videos only, binary — other surgery
                                 types are the hard negatives here)
 
-Each stage is an independent classifier trained on the pooled CLIP
-embeddings from embed_frames.py. Stages are trained separately so you can
-debug/evaluate each one on its own before chaining them at inference time.
+Each stage is an independent tree-ensemble classifier trained on the
+pooled CLIP embeddings from embed_frames.py. Stages are trained separately
+so you can debug/evaluate each one on its own before chaining them at
+inference time.
 
 Expects a labels CSV with columns: video_id, is_surgery, surgery_type
   - is_surgery: 0 or 1
   - surgery_type: "cataract", "other_surgery", or blank if is_surgery=0
 
 Usage:
-    python train_cascade.py --embeddings embeddings.parquet --labels labels.csv --out_dir models/
+    python train_trees_cascade.py --embeddings embeddings.parquet --labels labels.csv --out_dir models/
 """
 
 import argparse
@@ -25,7 +30,7 @@ import os
 import numpy as np
 import pandas as pd
 from joblib import dump
-from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
 
@@ -55,6 +60,35 @@ def load_data(embeddings_path: str, labels_path: str) -> pd.DataFrame:
     return df
 
 
+def _sample_weights(y: np.ndarray) -> np.ndarray:
+    """
+    GradientBoostingClassifier has no built-in class_weight="balanced"
+    option (unlike LogisticRegression/RandomForest), so we compute
+    per-sample weights manually and pass them via sample_weight= at fit
+    time to get the same class-balancing behavior.
+    """
+    classes, counts = np.unique(y, return_counts=True)
+    freq = dict(zip(classes, counts))
+    n = len(y)
+    weight_per_class = {c: n / (len(classes) * cnt) for c, cnt in freq.items()}
+    return np.array([weight_per_class[label] for label in y])
+
+
+def safe_split(X, y, test_size=0.2, random_state=42):
+    """
+    Stratified train/val split that falls back to a plain (unstratified)
+    split when a class has too few members to stratify — this matters
+    for small smoke-test runs (e.g. orchestrator --test with 5 videos),
+    where stratify=y would otherwise raise ValueError.
+    """
+    try:
+        return train_test_split(X, y, test_size=test_size, random_state=random_state, stratify=y)
+    except ValueError as e:
+        print(f"[warn] stratified split failed ({e}); falling back to a plain split "
+              f"(expected on tiny/test-mode datasets)")
+        return train_test_split(X, y, test_size=test_size, random_state=random_state)
+
+
 def train_binary_stage(X: np.ndarray, y: np.ndarray, stage_name: str):
     """
     Generic trainer for a single binary classification stage.
@@ -63,29 +97,34 @@ def train_binary_stage(X: np.ndarray, y: np.ndarray, stage_name: str):
     - y: binary labels (0/1)
     - stage_name: human-readable name used in printed reports
 
-    Splits data into train/val, fits a Logistic Regression model,
+    Splits data into train/val, fits a gradient-boosted tree ensemble,
     prints a validation report, and returns the fitted classifier.
     """
     # Hold out 20% of the data for validation, stratified so both
     # splits preserve the original class balance (important since
     # cataract vs. other-surgery is likely imbalanced).
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
+    X_train, X_val, y_train, y_val = safe_split(X, y, test_size=0.2, random_state=42)
 
-    # class_weight="balanced" automatically up-weights the minority
-    # class in the loss function, compensating for class imbalance
-    # without needing manual resampling.
-    clf = LogisticRegression(max_iter=2000, class_weight="balanced")
-    clf.fit(X_train, y_train)
+    sample_weight = _sample_weights(y_train)
+
+    clf = GradientBoostingClassifier(
+        n_estimators=300,
+        max_depth=3,
+        learning_rate=0.05,
+        subsample=0.8,
+        random_state=42,
+    )
+    clf.fit(X_train, y_train, sample_weight=sample_weight)
 
     # Evaluate on the held-out validation set and print diagnostics
     # so each stage can be sanity-checked independently.
     preds = clf.predict(X_val)
     print(f"\n=== {stage_name} validation report ===")
-    print(classification_report(y_val, preds))
+    # labels=[0, 1] keeps this from crashing when a tiny (e.g. test-mode)
+    # split doesn't happen to contain both classes.
+    print(classification_report(y_val, preds, labels=[0, 1], zero_division=0))
     print("Confusion matrix:")
-    print(confusion_matrix(y_val, preds))
+    print(confusion_matrix(y_val, preds, labels=[0, 1]))
 
     return clf
 
@@ -147,6 +186,7 @@ def main():
     # inference code can interpret predict() outputs consistently
     # without hardcoding label meanings elsewhere.
     meta = {
+        "model_type": "gradient_boosted_trees",
         "stage1_classes": ["not_surgery", "surgery"],
         "stage2_classes": ["not_cataract", "cataract"],
     }
@@ -158,3 +198,13 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# NOTE ON HISTORY: this file used to be byte-for-byte identical to the
+# train_cascade.py that now lives in high_compute_nn_cascade/ — both
+# trained a plain sklearn LogisticRegression per stage, so neither
+# script actually matched its own folder name ("stacked trees" wasn't
+# using trees; "high compute NN" wasn't a neural net at all, and was
+# also duplicated code rather than a distinct approach). This file was
+# updated to use GradientBoostingClassifier so the folder's name is
+# accurate. See classifier/README.md for the same fix applied to
+# high_compute_nn_cascade/.

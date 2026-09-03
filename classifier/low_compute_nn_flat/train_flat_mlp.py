@@ -1,10 +1,12 @@
 """
-train_mlp_option_a.py
+train_flat_mlp.py
 
-Flat 3-class MLP classifier trained on frozen CLIP embeddings
-(embeddings.parquet, produced by embed_frames.py — same input as
-train_cascade.py, but here we train ONE model with 3 outputs instead
-of two chained binary models).
+low_compute_nn_flat: Flat 3-class MLP classifier trained on frozen CLIP
+embeddings (embeddings.parquet, produced by embed_frames.py). Unlike the
+two-stage cascades in the other approach folders, this trains ONE small
+model with 3 outputs directly, which is why it's the "low compute" NN
+approach: a single lightweight network (256 -> 64 -> 3) with no chained
+stages and no need to train two separate classifiers.
 
 Classes:
     0 = not_surgery
@@ -12,7 +14,7 @@ Classes:
     2 = cataract
 
 Usage:
-    python train_mlp_option_a.py --embeddings embeddings.parquet \
+    python train_flat_mlp.py --embeddings embeddings.parquet \
         --labels labels.csv --out_dir models_mlp/
 """
 
@@ -29,6 +31,21 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.preprocessing import StandardScaler
 from joblib import dump
+
+
+def safe_split(X, y, test_size, random_state=42):
+    """
+    Stratified split that falls back to a plain (unstratified) split when
+    a class has too few members to stratify — matters for small smoke
+    tests (e.g. orchestrator --test with 5 videos), where stratify=y
+    would otherwise raise ValueError.
+    """
+    try:
+        return train_test_split(X, y, test_size=test_size, random_state=random_state, stratify=y)
+    except ValueError as e:
+        print(f"[warn] stratified split failed ({e}); falling back to a plain split "
+              f"(expected on tiny/test-mode datasets)")
+        return train_test_split(X, y, test_size=test_size, random_state=random_state)
 
 
 def build_labels(df: pd.DataFrame) -> pd.DataFrame:
@@ -166,12 +183,8 @@ def main():
     X = scaler.fit_transform(X)
     dump(scaler, os.path.join(args.out_dir, "scaler.joblib"))
 
-    X_train, X_temp, y_train, y_temp = train_test_split(
-        X, y, test_size=0.3, random_state=42, stratify=y
-    )
-    X_val, X_test, y_val, y_test = train_test_split(
-        X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp
-    )
+    X_train, X_temp, y_train, y_temp = safe_split(X, y, test_size=0.3, random_state=42)
+    X_val, X_test, y_val, y_test = safe_split(X_temp, y_temp, test_size=0.5, random_state=42)
 
     train_loader = DataLoader(EmbeddingDataset(X_train, y_train),
                                batch_size=args.batch_size, shuffle=True)
@@ -179,7 +192,9 @@ def main():
     test_loader = DataLoader(EmbeddingDataset(X_test, y_test), batch_size=args.batch_size)
 
     class_counts = np.bincount(y_train, minlength=3)
-    class_weights = torch.tensor(len(y_train) / (3 * class_counts), dtype=torch.float32)
+    # np.maximum guards against a class with 0 training samples (possible on
+    # tiny/test-mode datasets), which would otherwise divide by zero.
+    class_weights = torch.tensor(len(y_train) / (3 * np.maximum(class_counts, 1)), dtype=torch.float32)
     print("Class weights:", class_weights)
 
     model = MLPClassifier(input_dim=X.shape[1], num_classes=3).to(device)
@@ -196,9 +211,12 @@ def main():
             all_labels.extend(y_batch.numpy())
 
     print("\n=== Final test set report ===")
-    print(classification_report(all_labels, all_preds, target_names=class_names))
+    # labels=range(len(class_names)) keeps this from crashing when a tiny
+    # (e.g. test-mode) split doesn't happen to contain every class.
+    print(classification_report(all_labels, all_preds, labels=list(range(len(class_names))),
+                                 target_names=class_names, zero_division=0))
     print("Confusion matrix:")
-    print(confusion_matrix(all_labels, all_preds))
+    print(confusion_matrix(all_labels, all_preds, labels=list(range(len(class_names)))))
 
     torch.save({
         "model_state_dict": model.state_dict(),

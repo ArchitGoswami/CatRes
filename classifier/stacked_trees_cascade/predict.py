@@ -1,14 +1,14 @@
 """
 predict.py
 
-Runs the full cascade on a single new video:
+Runs the full stacked_trees_cascade pipeline on a single new video:
     1. Extract frames
     2. Embed with CLIP
-    3. Stage 1: is it a sport?
-    4. If yes -> Stage 2: is it baseball?
+    3. Stage 1: is it surgery?
+    4. If yes -> Stage 2: is it cataract surgery?
 
-Final label is one of: "not_sport", "sport_other" (includes cricket etc.),
-"baseball".
+Final label is one of: "not_surgery", "surgery_other" (any other surgery
+type), "cataract".
 
 Usage:
     python predict.py --video path/to/clip.mp4 --model_dir models/
@@ -30,8 +30,8 @@ from extract_frames import extract_frames_from_video
 def classify_video(video_path: str, model_dir: str, n_frames: int = 8, device: str = None):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    stage1_clf = load(os.path.join(model_dir, "stage1_is_sport.joblib"))
-    stage2_clf = load(os.path.join(model_dir, "stage2_is_baseball.joblib"))
+    stage1_clf = load(os.path.join(model_dir, "stage1_is_surgery.joblib"))
+    stage2_clf = load(os.path.join(model_dir, "stage2_is_cataract.joblib"))
 
     clip_model, preprocess = load_clip(device)
 
@@ -52,18 +52,18 @@ def classify_video(video_path: str, model_dir: str, n_frames: int = 8, device: s
 
     result = {
         "video": video_path,
-        "is_sport": bool(stage1_pred),
-        "is_sport_confidence": float(max(stage1_prob)),
+        "is_surgery": bool(stage1_pred),
+        "is_surgery_confidence": float(max(stage1_prob)),
     }
 
     if stage1_pred == 1:
         stage2_pred = stage2_clf.predict(X)[0]
         stage2_prob = stage2_clf.predict_proba(X)[0]
-        result["is_baseball"] = bool(stage2_pred)
-        result["is_baseball_confidence"] = float(max(stage2_prob))
-        result["final_label"] = "baseball" if stage2_pred == 1 else "sport_other"
+        result["is_cataract"] = bool(stage2_pred)
+        result["is_cataract_confidence"] = float(max(stage2_prob))
+        result["final_label"] = "cataract" if stage2_pred == 1 else "surgery_other"
     else:
-        result["final_label"] = "not_sport"
+        result["final_label"] = "not_surgery"
 
     return result
 
