@@ -36,6 +36,26 @@ Skip extraction/embedding if you already have embeddings.parquet:
 
 Only run specific approaches:
     python orchestrator.py --raw_videos raw_videos/ --labels labels.csv --approaches low_compute_nn_flat stacked_trees_cascade
+
+Merge multiple source folders (e.g. one per dataset) before extraction:
+    python orchestrator.py --raw_videos cataracts/ cholec80/ kinetics_subset/ --labels labels.csv --out_dir runs/
+    (Filenames are kept as-is unless two sources have a clashing filename,
+    in which case the later file is prefixed with its source folder name --
+    watch the printed [merge] warnings and update labels.csv's video_id
+    for any renamed file.)
+
+Label videos by folder instead of hand-writing labels.csv:
+    python orchestrator.py \
+        --not_surgery kinetics_subset/ something_something/ \
+        --other_surgery cholec80/ jigsaws/ \
+        --cataract cataracts/ cataract101/ \
+        --out_dir runs/
+    (Every video in a --not_surgery folder is labeled is_surgery=0; every
+    video in --other_surgery is is_surgery=1, surgery_type=other_surgery;
+    every video in --cataract is is_surgery=1, surgery_type=cataract.
+    Folders are merged into one raw_videos_merged/ dir and labels.csv is
+    written automatically to the run's output dir -- do not pass --labels
+    or --raw_videos alongside these three flags.)
 """
 
 import argparse
@@ -83,6 +103,119 @@ def run_cmd(cmd: list[str], log_path: Path, cwd: Path) -> tuple[int, float]:
         proc = subprocess.run(cmd, cwd=cwd, stdout=log_file, stderr=subprocess.STDOUT)
     elapsed = time.time() - start
     return proc.returncode, elapsed
+
+
+def merge_video_sources(sources: list[Path], staging_dir: Path, extensions: list[str]) -> Path:
+    """
+    Symlink (falling back to copy, e.g. across filesystems) video files from
+    one or more source directories into a single flat staging directory, so
+    the rest of the pipeline can keep treating raw video input as one
+    folder -- extract_frames.py itself is untouched.
+
+    Filenames are preserved as-is so they keep matching the video_id values
+    already written in labels.csv. If two sources contain a file with the
+    same name, the later one is disambiguated by prefixing it with its
+    source folder's name, and a warning is printed so you can check whether
+    labels.csv needs updating for that file.
+    """
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    seen_names: dict[str, Path] = {}
+    collisions = []
+
+    for src_dir in sources:
+        src_dir = Path(src_dir)
+        if not src_dir.is_dir():
+            raise FileNotFoundError(f"--raw_videos source not found or not a directory: {src_dir}")
+        files = sorted(p for p in src_dir.iterdir() if p.suffix.lower() in extensions)
+        for f in files:
+            target_name = f.name
+            if target_name in seen_names:
+                target_name = f"{src_dir.name}_{f.name}"
+                collisions.append((f, seen_names[f.name], staging_dir / target_name))
+            seen_names.setdefault(f.name, f)
+
+            target = staging_dir / target_name
+            if target.exists() or target.is_symlink():
+                continue  # already staged (e.g. re-run over the same out_dir)
+            try:
+                target.symlink_to(f.resolve())
+            except OSError:
+                shutil.copy2(f, target)
+
+    if collisions:
+        print(f"[merge] {len(collisions)} filename collision(s) across sources -- renamed to disambiguate:")
+        for original, first_seen, renamed in collisions:
+            print(f"  [warn] {original} collides with {first_seen}; staged as {renamed.name}"
+                  f" -- update labels.csv's video_id for this file if needed")
+
+    n_staged = sum(1 for _ in staging_dir.iterdir())
+    print(f"[merge] Staged {n_staged} videos from {len(sources)} source folder(s) into {staging_dir}")
+    return staging_dir
+
+
+CATEGORY_TO_LABELS = {
+    "not_surgery": {"is_surgery": 0, "surgery_type": ""},
+    "other_surgery": {"is_surgery": 1, "surgery_type": "other_surgery"},
+    "cataract": {"is_surgery": 1, "surgery_type": "cataract"},
+}
+
+
+def merge_and_label_by_category(category_dirs: dict[str, list[Path]], staging_dir: Path,
+                                 extensions: list[str]) -> tuple[Path, "pd.DataFrame"]:
+    """
+    Merge video folders grouped by category ("not_surgery", "other_surgery",
+    "cataract") into one staging directory AND build a labels DataFrame at
+    the same time, so you never have to hand-write labels.csv -- you just
+    say which folders belong to which category and every video in that
+    folder gets that label.
+
+    Uses the same collision-handling as merge_video_sources: if two source
+    folders (even across different categories) contain a file with the same
+    name, the later one is renamed with its source folder as a prefix, and
+    a warning is printed.
+    """
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    seen_names: dict[str, Path] = {}
+    collisions = []
+    rows = []
+
+    for category in ("not_surgery", "other_surgery", "cataract"):
+        for src_dir in category_dirs.get(category, []):
+            src_dir = Path(src_dir)
+            if not src_dir.is_dir():
+                raise FileNotFoundError(f"--{category} source not found or not a directory: {src_dir}")
+            files = sorted(p for p in src_dir.iterdir() if p.suffix.lower() in extensions)
+            for f in files:
+                target_name = f.name
+                if target_name in seen_names:
+                    target_name = f"{src_dir.name}_{f.name}"
+                    collisions.append((f, seen_names[f.name], staging_dir / target_name))
+                seen_names.setdefault(f.name, f)
+
+                target = staging_dir / target_name
+                if not target.exists() and not target.is_symlink():
+                    try:
+                        target.symlink_to(f.resolve())
+                    except OSError:
+                        shutil.copy2(f, target)
+
+                label = CATEGORY_TO_LABELS[category]
+                rows.append({"video_id": target.stem, "is_surgery": label["is_surgery"],
+                             "surgery_type": label["surgery_type"]})
+
+    if collisions:
+        print(f"[merge] {len(collisions)} filename collision(s) across sources -- renamed to disambiguate:")
+        for original, first_seen, renamed in collisions:
+            print(f"  [warn] {original} collides with {first_seen}; staged as {renamed.name}")
+
+    labels_df = pd.DataFrame(rows, columns=["video_id", "is_surgery", "surgery_type"])
+    n_cataract = int((labels_df["surgery_type"] == "cataract").sum())
+    n_other = int((labels_df["surgery_type"] == "other_surgery").sum())
+    n_not = int((labels_df["is_surgery"] == 0).sum())
+    print(f"[merge] Staged {len(labels_df)} videos into {staging_dir} "
+          f"(cataract={n_cataract}, other_surgery={n_other}, not_surgery={n_not})")
+
+    return staging_dir, labels_df
 
 
 def make_test_subset(raw_videos: Path, labels_csv: Path, test_dir: Path, test_n: int,
@@ -135,8 +268,11 @@ def make_test_subset(raw_videos: Path, labels_csv: Path, test_dir: Path, test_n:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--raw_videos", help="Directory of raw video files (skip if using --embeddings)")
-    parser.add_argument("--labels", required=True, help="Path to labels.csv")
+    parser.add_argument("--raw_videos", nargs="+", help="One or more directories of raw video files (skip if using --embeddings or the category flags below). Multiple directories are merged into one before extraction.")
+    parser.add_argument("--labels", help="Path to labels.csv. Required unless using --not_surgery/--other_surgery/--cataract, which auto-generate it.")
+    parser.add_argument("--not_surgery", nargs="+", help="Folder(s) whose videos are all NOT surgery (is_surgery=0). Alternative to --raw_videos/--labels.")
+    parser.add_argument("--other_surgery", nargs="+", help="Folder(s) whose videos are all non-cataract surgery (is_surgery=1, surgery_type=other_surgery). Alternative to --raw_videos/--labels.")
+    parser.add_argument("--cataract", nargs="+", help="Folder(s) whose videos are all cataract surgery (is_surgery=1, surgery_type=cataract). Alternative to --raw_videos/--labels.")
     parser.add_argument("--embeddings", help="Path to a precomputed embeddings.parquet (implies --skip_extract --skip_embed)")
     parser.add_argument("--out_dir", default="runs", help="Root directory for run outputs")
     parser.add_argument("--n_frames", type=int, default=8)
@@ -153,8 +289,19 @@ def main():
         args.skip_extract = True
         args.skip_embed = True
 
-    if not args.embeddings and not args.raw_videos:
-        parser.error("Provide either --raw_videos (to extract+embed) or --embeddings (precomputed)")
+    using_category_folders = bool(args.not_surgery or args.other_surgery or args.cataract)
+
+    if using_category_folders and not (args.not_surgery and args.other_surgery and args.cataract):
+        parser.error("--not_surgery, --other_surgery, and --cataract must all be provided together "
+                     "(the classifier trains a 3-class model and needs examples of all three)")
+    if using_category_folders and args.raw_videos:
+        parser.error("Use either --raw_videos, or --not_surgery/--other_surgery/--cataract, not both")
+    if using_category_folders and args.labels:
+        parser.error("--labels is auto-generated from --not_surgery/--other_surgery/--cataract; omit --labels")
+    if not using_category_folders and not args.embeddings and not args.raw_videos:
+        parser.error("Provide either --raw_videos, --not_surgery/--other_surgery/--cataract (to extract+embed), or --embeddings (precomputed)")
+    if not using_category_folders and not args.labels:
+        parser.error("--labels is required unless using --not_surgery/--other_surgery/--cataract")
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     run_name = f"{'test_' if args.test else ''}run_{timestamp}"
@@ -176,8 +323,42 @@ def main():
     print(f"=== Run: {run_name} (test_mode={args.test}) ===")
     print(f"Output dir: {run_dir}")
 
-    labels_path = Path(args.labels)
-    raw_videos_path = Path(args.raw_videos) if args.raw_videos else None
+    labels_path = Path(args.labels) if args.labels else None
+    raw_videos_path = None
+
+    if using_category_folders:
+        category_dirs = {
+            "not_surgery": [Path(p) for p in (args.not_surgery or [])],
+            "other_surgery": [Path(p) for p in (args.other_surgery or [])],
+            "cataract": [Path(p) for p in (args.cataract or [])],
+        }
+        n_folders = sum(len(v) for v in category_dirs.values())
+        print(f"\n[merge] Building labels.csv from {n_folders} category folder(s)...")
+        raw_videos_path, labels_df = merge_and_label_by_category(
+            category_dirs, run_dir / "raw_videos_merged", args.extensions
+        )
+        labels_path = run_dir / "labels.csv"
+        labels_df.to_csv(labels_path, index=False)
+        report["steps"]["merge_and_label"] = {
+            "not_surgery_dirs": [str(p) for p in category_dirs["not_surgery"]],
+            "other_surgery_dirs": [str(p) for p in category_dirs["other_surgery"]],
+            "cataract_dirs": [str(p) for p in category_dirs["cataract"]],
+            "merged_dir": str(raw_videos_path),
+            "labels_path": str(labels_path),
+            "n_videos": len(labels_df),
+        }
+        print(f"[merge] Wrote {labels_path} ({len(labels_df)} rows)")
+    elif args.raw_videos:
+        raw_sources = [Path(p) for p in args.raw_videos]
+        if len(raw_sources) == 1:
+            raw_videos_path = raw_sources[0]
+        else:
+            print(f"\n[merge] Combining {len(raw_sources)} source folders into one...")
+            raw_videos_path = merge_video_sources(raw_sources, run_dir / "raw_videos_merged", args.extensions)
+            report["steps"]["merge_sources"] = {
+                "sources": [str(p) for p in raw_sources],
+                "merged_dir": str(raw_videos_path),
+            }
 
     # ---------- Optionally shrink to a small test subset first ----------
     if args.test:
@@ -288,6 +469,14 @@ def _finish(report: dict, run_dir: Path, success: bool, reason: str = ""):
         if step == "test_subset":
             md_lines.append(f"- `{step}`: sampled {info.get('actual')}/{info.get('requested')} videos "
                              f"-> `{info.get('labels_path')}`")
+        elif step == "merge_sources":
+            md_lines.append(f"- `{step}`: merged {len(info.get('sources', []))} source folder(s) "
+                             f"-> `{info.get('merged_dir')}`")
+        elif step == "merge_and_label":
+            n_dirs = (len(info.get('not_surgery_dirs', [])) + len(info.get('other_surgery_dirs', []))
+                      + len(info.get('cataract_dirs', [])))
+            md_lines.append(f"- `{step}`: labeled {info.get('n_videos')} videos from {n_dirs} folder(s) "
+                             f"-> `{info.get('merged_dir')}`, `{info.get('labels_path')}`")
         elif info.get("skipped"):
             md_lines.append(f"- `{step}`: skipped")
         else:
