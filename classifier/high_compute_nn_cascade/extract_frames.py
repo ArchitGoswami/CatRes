@@ -31,28 +31,29 @@ def sample_frame_indices(total_frames: int, n_frames: int) -> list[int]:
 
 def extract_frames_from_video(video_path: str, out_dir: str, n_frames: int) -> int:
     cap = cv2.VideoCapture(video_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    try:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    if total_frames <= 0:
+        if total_frames <= 0:
+            print(f"  [warn] could not read frame count for {video_path}, skipping")
+            return 0
+
+        indices = sample_frame_indices(total_frames, n_frames)
+        video_stem = Path(video_path).stem
+        saved = 0
+
+        for idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            out_path = os.path.join(out_dir, f"{video_stem}_f{idx:06d}.jpg")
+            cv2.imwrite(out_path, frame)
+            saved += 1
+
+        return saved
+    finally:
         cap.release()
-        print(f"  [warn] could not read frame count for {video_path}, skipping")
-        return 0
-
-    indices = sample_frame_indices(total_frames, n_frames)
-    video_stem = Path(video_path).stem
-    saved = 0
-
-    for idx in indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ok, frame = cap.read()
-        if not ok:
-            continue
-        out_path = os.path.join(out_dir, f"{video_stem}_f{idx:06d}.jpg")
-        cv2.imwrite(out_path, frame)
-        saved += 1
-
-    cap.release()
-    return saved
 
 
 def main():
@@ -76,8 +77,22 @@ def main():
     print(f"Found {len(video_paths)} videos in {args.video_dir}")
 
     total_saved = 0
+    failed = []
     for vp in tqdm(video_paths, desc="Extracting frames"):
-        total_saved += extract_frames_from_video(vp, args.out_dir, args.n_frames)
+        try:
+            total_saved += extract_frames_from_video(vp, args.out_dir, args.n_frames)
+        except Exception as e:
+            # A file with a video extension isn't guaranteed to actually be a
+            # readable video (corrupted download, truncated file, mislabeled
+            # extension, permissions issue, unsupported codec, ...). Log it
+            # and keep going rather than losing the whole run over one file.
+            print(f"  [warn] failed to process {vp} ({type(e).__name__}: {e}), skipping")
+            failed.append(vp)
+
+    if failed:
+        print(f"\n[warn] {len(failed)} file(s) failed to process and were skipped:")
+        for f in failed:
+            print(f"  - {f}")
 
     print(f"Done. Saved {total_saved} frames to {args.out_dir}")
 

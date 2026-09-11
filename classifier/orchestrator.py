@@ -121,12 +121,13 @@ def merge_video_sources(sources: list[Path], staging_dir: Path, extensions: list
     staging_dir.mkdir(parents=True, exist_ok=True)
     seen_names: dict[str, Path] = {}
     collisions = []
+    failed = []
 
     for src_dir in sources:
         src_dir = Path(src_dir)
         if not src_dir.is_dir():
             raise FileNotFoundError(f"--raw_videos source not found or not a directory: {src_dir}")
-        files = sorted(p for p in src_dir.iterdir() if p.suffix.lower() in extensions)
+        files = sorted(p for p in src_dir.iterdir() if p.is_file() and p.suffix.lower() in extensions)
         for f in files:
             target_name = f.name
             if target_name in seen_names:
@@ -138,15 +139,28 @@ def merge_video_sources(sources: list[Path], staging_dir: Path, extensions: list
             if target.exists() or target.is_symlink():
                 continue  # already staged (e.g. re-run over the same out_dir)
             try:
-                target.symlink_to(f.resolve())
-            except OSError:
-                shutil.copy2(f, target)
+                try:
+                    target.symlink_to(f.resolve())
+                except OSError:
+                    shutil.copy2(f, target)
+            except Exception as e:
+                # A file with a video extension isn't guaranteed to actually
+                # be stageable (permission error, broken symlink target,
+                # disappeared mid-run, ...). Log it and keep going rather
+                # than losing the whole merge over one file.
+                print(f"  [warn] could not stage {f} ({type(e).__name__}: {e}), skipping")
+                failed.append(f)
 
     if collisions:
         print(f"[merge] {len(collisions)} filename collision(s) across sources -- renamed to disambiguate:")
         for original, first_seen, renamed in collisions:
             print(f"  [warn] {original} collides with {first_seen}; staged as {renamed.name}"
                   f" -- update labels.csv's video_id for this file if needed")
+
+    if failed:
+        print(f"[merge] {len(failed)} file(s) could not be staged and were skipped:")
+        for f in failed:
+            print(f"  - {f}")
 
     n_staged = sum(1 for _ in staging_dir.iterdir())
     print(f"[merge] Staged {n_staged} videos from {len(sources)} source folder(s) into {staging_dir}")
@@ -177,6 +191,7 @@ def merge_and_label_by_category(category_dirs: dict[str, list[Path]], staging_di
     staging_dir.mkdir(parents=True, exist_ok=True)
     seen_names: dict[str, Path] = {}
     collisions = []
+    failed = []
     rows = []
 
     for category in ("not_surgery", "other_surgery", "cataract"):
@@ -184,7 +199,7 @@ def merge_and_label_by_category(category_dirs: dict[str, list[Path]], staging_di
             src_dir = Path(src_dir)
             if not src_dir.is_dir():
                 raise FileNotFoundError(f"--{category} source not found or not a directory: {src_dir}")
-            files = sorted(p for p in src_dir.iterdir() if p.suffix.lower() in extensions)
+            files = sorted(p for p in src_dir.iterdir() if p.is_file() and p.suffix.lower() in extensions)
             for f in files:
                 target_name = f.name
                 if target_name in seen_names:
@@ -195,9 +210,20 @@ def merge_and_label_by_category(category_dirs: dict[str, list[Path]], staging_di
                 target = staging_dir / target_name
                 if not target.exists() and not target.is_symlink():
                     try:
-                        target.symlink_to(f.resolve())
-                    except OSError:
-                        shutil.copy2(f, target)
+                        try:
+                            target.symlink_to(f.resolve())
+                        except OSError:
+                            shutil.copy2(f, target)
+                    except Exception as e:
+                        # A file with a video extension isn't guaranteed to
+                        # actually be stageable (permission error, broken
+                        # symlink target, disappeared mid-run, ...). Log it
+                        # and skip labeling it too, rather than losing the
+                        # whole run or writing a labels.csv row that points
+                        # at a video which was never actually staged.
+                        print(f"  [warn] could not stage {f} ({type(e).__name__}: {e}), skipping")
+                        failed.append(f)
+                        continue
 
                 label = CATEGORY_TO_LABELS[category]
                 rows.append({"video_id": target.stem, "is_surgery": label["is_surgery"],
@@ -207,6 +233,11 @@ def merge_and_label_by_category(category_dirs: dict[str, list[Path]], staging_di
         print(f"[merge] {len(collisions)} filename collision(s) across sources -- renamed to disambiguate:")
         for original, first_seen, renamed in collisions:
             print(f"  [warn] {original} collides with {first_seen}; staged as {renamed.name}")
+
+    if failed:
+        print(f"[merge] {len(failed)} file(s) could not be staged and were skipped:")
+        for f in failed:
+            print(f"  - {f}")
 
     labels_df = pd.DataFrame(rows, columns=["video_id", "is_surgery", "surgery_type"])
     n_cataract = int((labels_df["surgery_type"] == "cataract").sum())
@@ -250,14 +281,19 @@ def make_test_subset(raw_videos: Path, labels_csv: Path, test_dir: Path, test_n:
     if raw_videos is not None:
         video_dir = test_dir / "raw_videos_sample"
         video_dir.mkdir(exist_ok=True)
-        available = {p.stem: p for p in Path(raw_videos).iterdir() if p.suffix.lower() in extensions}
+        available = {p.stem: p for p in Path(raw_videos).iterdir()
+                     if p.is_file() and p.suffix.lower() in extensions}
         missing = []
         for vid in subset_df["video_id"]:
             src = available.get(vid)
             if src is None:
                 missing.append(vid)
                 continue
-            shutil.copy2(src, video_dir / src.name)
+            try:
+                shutil.copy2(src, video_dir / src.name)
+            except Exception as e:
+                print(f"  [warn] could not copy {src} into test subset ({type(e).__name__}: {e}), skipping")
+                missing.append(vid)
         if missing:
             print(f"[warn] {len(missing)} sampled video_ids have no matching file in "
                   f"{raw_videos}: {missing}")
@@ -282,7 +318,9 @@ def main():
     parser.add_argument("--test_n", type=int, default=5, help="Number of videos to use in --test mode")
     parser.add_argument("--skip_extract", action="store_true", help="Skip frame extraction (frames/ already exists, or using --embeddings)")
     parser.add_argument("--skip_embed", action="store_true", help="Skip embedding (embeddings.parquet already exists, or using --embeddings)")
-    parser.add_argument("--extensions", nargs="+", default=[".mp4", ".mov", ".avi", ".mkv"])
+    parser.add_argument("--extensions", nargs="+",
+                         default=[".mp4", ".mov", ".avi", ".mkv", ".webm", ".wmv", ".m4v",
+                                  ".flv", ".mpg", ".mpeg", ".3gp", ".ts"])
     args = parser.parse_args()
 
     if args.embeddings:
@@ -383,6 +421,7 @@ def main():
             "--video_dir", str(raw_videos_path),
             "--out_dir", str(frames_dir),
             "--n_frames", str(args.n_frames),
+            "--extensions", *args.extensions,
         ]
         rc, elapsed = run_cmd(cmd, logs_dir / "extract_frames.log", cwd=REPO_ROOT / SHARED_SCRIPTS_SOURCE)
         report["steps"]["extract_frames"] = {"returncode": rc, "elapsed_sec": round(elapsed, 2), "log": str(logs_dir / "extract_frames.log")}

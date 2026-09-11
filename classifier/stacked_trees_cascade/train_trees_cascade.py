@@ -74,12 +74,12 @@ def _sample_weights(y: np.ndarray) -> np.ndarray:
     return np.array([weight_per_class[label] for label in y])
 
 
-def safe_split(X, y, test_size=0.2, random_state=42):
+def safe_split(X, y, test_size, random_state=42):
     """
-    Stratified train/val split that falls back to a plain (unstratified)
-    split when a class has too few members to stratify — this matters
-    for small smoke-test runs (e.g. orchestrator --test with 5 videos),
-    where stratify=y would otherwise raise ValueError.
+    Stratified split that falls back to a plain (unstratified) split when
+    a class has too few members to stratify — this matters for small
+    smoke-test runs (e.g. orchestrator --test with 5 videos), where
+    stratify=y would otherwise raise ValueError.
     """
     try:
         return train_test_split(X, y, test_size=test_size, random_state=random_state, stratify=y)
@@ -100,10 +100,14 @@ def train_binary_stage(X: np.ndarray, y: np.ndarray, stage_name: str):
     Splits data into train/val, fits a gradient-boosted tree ensemble,
     prints a validation report, and returns the fitted classifier.
     """
-    # Hold out 20% of the data for validation, stratified so both
+    # 70% train / 15% val / 15% held-out test, stratified so all three
     # splits preserve the original class balance (important since
-    # cataract vs. other-surgery is likely imbalanced).
-    X_train, X_val, y_train, y_val = safe_split(X, y, test_size=0.2, random_state=42)
+    # cataract vs. other-surgery is likely imbalanced). The val split is
+    # used for a quick diagnostic during training; the test split is
+    # never touched until final evaluation below, so its numbers are an
+    # unbiased read on how the model generalizes.
+    X_train, X_temp, y_train, y_temp = safe_split(X, y, test_size=0.3, random_state=42)
+    X_val, X_test, y_val, y_test = safe_split(X_temp, y_temp, test_size=0.5, random_state=42)
 
     sample_weight = _sample_weights(y_train)
 
@@ -116,15 +120,22 @@ def train_binary_stage(X: np.ndarray, y: np.ndarray, stage_name: str):
     )
     clf.fit(X_train, y_train, sample_weight=sample_weight)
 
-    # Evaluate on the held-out validation set and print diagnostics
-    # so each stage can be sanity-checked independently.
-    preds = clf.predict(X_val)
+    # Validation report: a quick diagnostic straight after training.
+    val_preds = clf.predict(X_val)
     print(f"\n=== {stage_name} validation report ===")
     # labels=[0, 1] keeps this from crashing when a tiny (e.g. test-mode)
     # split doesn't happen to contain both classes.
-    print(classification_report(y_val, preds, labels=[0, 1], zero_division=0))
+    print(classification_report(y_val, val_preds, labels=[0, 1], zero_division=0))
     print("Confusion matrix:")
-    print(confusion_matrix(y_val, preds, labels=[0, 1]))
+    print(confusion_matrix(y_val, val_preds, labels=[0, 1]))
+
+    # Test report: the real, unbiased final number — X_test was never
+    # used to fit the model or pick anything about it.
+    test_preds = clf.predict(X_test)
+    print(f"\n=== {stage_name} test report ===")
+    print(classification_report(y_test, test_preds, labels=[0, 1], zero_division=0))
+    print("Confusion matrix:")
+    print(confusion_matrix(y_test, test_preds, labels=[0, 1]))
 
     return clf
 
